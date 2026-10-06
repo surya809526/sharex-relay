@@ -1,442 +1,499 @@
 const express = require("express");
 const multer = require("multer");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
-const archiver = require("archiver");
 
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const ROOT = path.join(__dirname, "share_data");
 
-if (!fs.existsSync(ROOT)) {
-    fs.mkdirSync(ROOT, { recursive: true });
-}
+const UPLOAD_DIR = path.join(__dirname, "uploads");
 
-const sessions = new Map();
-
-const upload = multer({
-    dest: ROOT,
-    limits: {
-        fileSize: 10 * 1024 * 1024 * 1024
-    }
-});
-
-function randomId(length = 32) {
-    return crypto.randomBytes(length).toString("hex");
-}
-
-function safeName(name) {
-    return path.basename(name || "file");
-}
-
-function createSession() {
-    const id = randomId(16);
-
-    const folder = path.join(ROOT, id);
-
-    fs.mkdirSync(folder, {
-        recursive: true
-    });
-
-    const session = {
-        id,
-        folder,
-        files: [],
-        createdAt: Date.now(),
-        expiresAt: Date.now() + 30 * 60 * 1000
-    };
-
-    sessions.set(id, session);
-
-    return session;
-}
-
-function getSession(id) {
-    const session = sessions.get(id);
-
-    if (!session) {
-        return null;
-    }
-
-    if (Date.now() > session.expiresAt) {
-        deleteSession(id);
-        return null;
-    }
-
-    return session;
-}
-
-function deleteSession(id) {
-    const session = sessions.get(id);
-
-    if (!session) {
-        return;
-    }
-
-    try {
-        fs.rmSync(session.folder, {
-            recursive: true,
-            force: true
-        });
-    } catch (e) {}
-
-    sessions.delete(id);
+if (!fs.existsSync(UPLOAD_DIR)) {
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        cb(null, UPLOAD_DIR);
+    },
+
+    filename: function (req, file, cb) {
+        const id = crypto.randomUUID();
+        cb(null, id + path.extname(file.originalname));
+    }
+});
+
+const upload = multer({
+    storage: storage,
+
+    limits: {
+        fileSize: 500 * 1024 * 1024
+    }
+});
+
+const transfers = new Map();
+
+function generateCode() {
+    let code;
+
+    do {
+        code = String(
+            Math.floor(100000 + Math.random() * 900000)
+        );
+    } while (transfers.has(code));
+
+    return code;
+}
+
+function cleanupExpired() {
+
+    const now = Date.now();
+
+    for (const [code, transfer] of transfers.entries()) {
+
+        if (transfer.expiresAt < now) {
+
+            try {
+                if (fs.existsSync(transfer.filePath)) {
+                    fs.unlinkSync(transfer.filePath);
+                }
+            } catch (e) {
+                console.log("Delete error:", e.message);
+            }
+
+            transfers.delete(code);
+        }
+    }
+}
+
+setInterval(cleanupExpired, 60 * 1000);
 
 app.get("/", (req, res) => {
-    res.send("ShareX Relay Server is running");
-});
 
-/* CREATE SESSION */
-app.post("/api/session", (req, res) => {
-    const session = createSession();
-
-    res.json({
-        success: true,
-        sessionId: session.id,
-        expiresIn: 1800
-    });
-});
-
-/* UPLOAD FILE */
-app.post(
-    "/api/session/:id/upload",
-    upload.single("file"),
-    (req, res) => {
-
-        const session = getSession(req.params.id);
-
-        if (!session) {
-            if (req.file) {
-                try {
-                    fs.unlinkSync(req.file.path);
-                } catch (e) {}
-            }
-
-            return res.status(404).json({
-                success: false,
-                error: "Session expired"
-            });
-        }
-
-        if (!req.file) {
-            return res.status(400).json({
-                success: false,
-                error: "No file"
-            });
-        }
-
-        const originalName =
-            safeName(
-                req.body.name ||
-                req.file.originalname
-            );
-
-        const fileId = randomId(12);
-
-        const finalPath = path.join(
-            session.folder,
-            fileId + "_" + originalName
-        );
-
-        fs.renameSync(
-            req.file.path,
-            finalPath
-        );
-
-        const item = {
-            id: fileId,
-            name: originalName,
-            path: finalPath,
-            size: req.file.size
-        };
-
-        session.files.push(item);
-
-        res.json({
-            success: true,
-            file: {
-                id: item.id,
-                name: item.name,
-                size: item.size
-            }
-        });
-    }
-);
-
-/* RECEIVER PAGE */
-app.get("/s/:id", (req, res) => {
-
-    const session = getSession(req.params.id);
-
-    if (!session) {
-        return res.status(404).send(`
-<!doctype html>
+    res.send(`
+<!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ShareX</title>
-</head>
-<body style="font-family:Arial;background:#090b10;color:white;text-align:center;padding:50px">
-<h2>Share expired</h2>
-<p>This ShareX link has expired.</p>
-</body>
-</html>
-`);
-    }
-
-    let cards = "";
-
-    session.files.forEach((file, index) => {
-
-        const size =
-            file.size < 1024 * 1024
-                ? (file.size / 1024).toFixed(1) + " KB"
-                : (file.size / 1024 / 1024).toFixed(1) + " MB";
-
-        cards += `
-<div class="file">
-    <div>
-        <b>${escapeHtml(file.name)}</b>
-        <small>${size}</small>
-    </div>
-
-    <a href="/api/session/${session.id}/download/${file.id}">
-        Download
-    </a>
-</div>
-`;
-    });
-
-    res.send(`
-<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-
-<title>ShareX Player</title>
 
 <style>
+* {
+    box-sizing:border-box;
+}
 
-body{
+body {
     margin:0;
-    background:#090b10;
+    min-height:100vh;
+    background:#070a0f;
     color:white;
     font-family:Arial,sans-serif;
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    padding:20px;
 }
 
-.container{
-    max-width:700px;
-    margin:auto;
-    padding:25px;
-}
-
-.logo{
+.card {
+    width:100%;
+    max-width:430px;
+    background:#121720;
+    border:1px solid #263041;
+    border-radius:24px;
+    padding:28px;
     text-align:center;
-    font-size:30px;
-    font-weight:bold;
-    margin-top:25px;
+    box-shadow:0 20px 60px rgba(0,0,0,.45);
 }
 
-.sub{
-    text-align:center;
+.logo {
+    font-size:34px;
+    font-weight:800;
+    margin-bottom:8px;
+}
+
+.sub {
     color:#9ca3af;
     margin-bottom:30px;
 }
 
-.info{
-    background:#151820;
-    padding:18px;
-    border-radius:18px;
-    margin-bottom:20px;
+input {
+    width:100%;
+    padding:16px;
+    background:#080c12;
+    color:white;
+    border:1px solid #374151;
+    border-radius:14px;
+    font-size:22px;
+    text-align:center;
+    letter-spacing:6px;
+    outline:none;
 }
 
-.downloadAll{
-    display:block;
-    text-align:center;
+button {
+    width:100%;
+    margin-top:16px;
+    padding:15px;
+    border-radius:14px;
+    border:1px solid #3b82f6;
     background:#2563eb;
     color:white;
-    padding:16px;
-    border-radius:14px;
-    text-decoration:none;
+    font-size:16px;
     font-weight:bold;
-    margin-bottom:20px;
+    cursor:pointer;
+    transition:.15s;
 }
 
-.file{
-    background:#151820;
-    padding:16px;
-    border-radius:15px;
-    margin:10px 0;
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    gap:15px;
+button:active {
+    transform:scale(.96);
 }
 
-.file b{
+#result {
+    margin-top:25px;
+}
+
+.file {
+    background:#080c12;
+    border:1px solid #293241;
+    border-radius:16px;
+    padding:18px;
+}
+
+.download {
     display:block;
-    word-break:break-word;
-}
-
-.file small{
-    color:#9ca3af;
-    display:block;
-    margin-top:5px;
-}
-
-.file a{
-    background:#16a34a;
-    color:white;
     text-decoration:none;
-    padding:10px 14px;
-    border-radius:10px;
-    white-space:nowrap;
+    background:#16a34a;
+    border:1px solid #4ade80;
+    color:white;
+    padding:15px;
+    border-radius:14px;
+    margin-top:15px;
+    font-weight:bold;
 }
 
+.error {
+    color:#f87171;
+}
+
+.ok {
+    color:#4ade80;
+}
 </style>
 </head>
 
 <body>
 
-<div class="container">
+<div class="card">
 
-<div class="logo">
-ShareX Player
+    <div class="logo">ShareX</div>
+
+    <div class="sub">
+        Internet File Sharing
+    </div>
+
+    <input
+        id="code"
+        maxlength="6"
+        inputmode="numeric"
+        placeholder="000000"
+    >
+
+    <button onclick="findFile()">
+        FIND FILE
+    </button>
+
+    <div id="result"></div>
+
 </div>
 
-<div class="sub">
-Secure temporary file sharing
-</div>
+<script>
 
-<div class="info">
-<b>${session.files.length}</b>
-file(s) available
-</div>
+async function findFile() {
 
-<a class="downloadAll"
-href="/api/session/${session.id}/all">
-Download All
-</a>
+    const code =
+        document.getElementById("code").value.trim();
 
-${cards}
+    const result =
+        document.getElementById("result");
 
-</div>
+    if (!/^\\d{6}$/.test(code)) {
+
+        result.innerHTML =
+            '<div class="error">Enter 6 digit code</div>';
+
+        return;
+    }
+
+    result.innerHTML = "Searching...";
+
+    try {
+
+        const response =
+            await fetch("/api/transfer/" + code);
+
+        const data =
+            await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                data.error || "Transfer not found"
+            );
+        }
+
+        result.innerHTML = `
+            <div class="file">
+
+                <div class="ok">
+                    Transfer Found
+                </div>
+
+                <h3>${escapeHtml(data.fileName)}</h3>
+
+                <div>
+                    ${formatBytes(data.fileSize)}
+                </div>
+
+                <a
+                    class="download"
+                    href="/api/download/${data.code}"
+                >
+                    DOWNLOAD FILE
+                </a>
+
+            </div>
+        `;
+
+    } catch (error) {
+
+        result.innerHTML =
+            '<div class="error">' +
+            escapeHtml(error.message) +
+            '</div>';
+    }
+}
+
+function formatBytes(bytes) {
+
+    if (bytes < 1024)
+        return bytes + " B";
+
+    if (bytes < 1024 * 1024)
+        return (bytes / 1024).toFixed(1) + " KB";
+
+    if (bytes < 1024 * 1024 * 1024)
+        return (bytes / 1024 / 1024).toFixed(1) + " MB";
+
+    return (
+        bytes /
+        1024 /
+        1024 /
+        1024
+    ).toFixed(1) + " GB";
+}
+
+function escapeHtml(value) {
+
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+</script>
 
 </body>
 </html>
-`);
+    `);
 });
 
-/* DOWNLOAD SINGLE FILE */
-app.get(
-    "/api/session/:id/download/:fileId",
+
+// ----------------------------------------
+// UPLOAD FILE
+// ----------------------------------------
+
+app.post(
+    "/api/upload",
+    upload.single("file"),
     (req, res) => {
 
-        const session =
-            getSession(req.params.id);
+        try {
 
-        if (!session) {
-            return res.status(404).send("Share expired");
+            if (!req.file) {
+
+                return res.status(400).json({
+                    error: "No file uploaded"
+                });
+            }
+
+            const code = generateCode();
+
+            const expiresAt =
+                Date.now() +
+                60 * 60 * 1000;
+
+            transfers.set(code, {
+
+                code: code,
+
+                fileName:
+                    req.file.originalname,
+
+                fileSize:
+                    req.file.size,
+
+                filePath:
+                    req.file.path,
+
+                expiresAt:
+                    expiresAt
+            });
+
+            res.json({
+
+                success: true,
+
+                code: code,
+
+                fileName:
+                    req.file.originalname,
+
+                fileSize:
+                    req.file.size,
+
+                expiresAt:
+                    expiresAt,
+
+                downloadUrl:
+                    "/api/download/" + code
+            });
+
+        } catch (error) {
+
+            console.error(error);
+
+            res.status(500).json({
+                error: "Upload failed"
+            });
+        }
+    }
+);
+
+
+// ----------------------------------------
+// GET TRANSFER INFORMATION
+// ----------------------------------------
+
+app.get(
+    "/api/transfer/:code",
+    (req, res) => {
+
+        cleanupExpired();
+
+        const code =
+            req.params.code;
+
+        const transfer =
+            transfers.get(code);
+
+        if (!transfer) {
+
+            return res.status(404).json({
+                error:
+                    "Transfer not found or expired"
+            });
         }
 
-        const file =
-            session.files.find(
-                x => x.id === req.params.fileId
-            );
+        res.json({
 
-        if (!file) {
-            return res.status(404).send("File not found");
+            code:
+                transfer.code,
+
+            fileName:
+                transfer.fileName,
+
+            fileSize:
+                transfer.fileSize,
+
+            expiresAt:
+                transfer.expiresAt
+        });
+    }
+);
+
+
+// ----------------------------------------
+// DOWNLOAD FILE
+// ----------------------------------------
+
+app.get(
+    "/api/download/:code",
+    (req, res) => {
+
+        cleanupExpired();
+
+        const code =
+            req.params.code;
+
+        const transfer =
+            transfers.get(code);
+
+        if (!transfer) {
+
+            return res.status(404).send(
+                "Transfer not found or expired"
+            );
+        }
+
+        if (!fs.existsSync(transfer.filePath)) {
+
+            transfers.delete(code);
+
+            return res.status(404).send(
+                "File no longer exists"
+            );
         }
 
         res.download(
-            file.path,
-            file.name
-        );
-    }
-);
+            transfer.filePath,
+            transfer.fileName,
+            (error) => {
 
-/* DOWNLOAD ALL */
-app.get(
-    "/api/session/:id/all",
-    (req, res) => {
-
-        const session =
-            getSession(req.params.id);
-
-        if (!session) {
-            return res.status(404).send("Share expired");
-        }
-
-        res.setHeader(
-            "Content-Type",
-            "application/zip"
-        );
-
-        res.setHeader(
-            "Content-Disposition",
-            'attachment; filename="ShareX-Files.zip"'
-        );
-
-        const archive =
-            archiver("zip", {
-                zlib: {
-                    level: 5
+                if (error) {
+                    console.log(
+                        "Download error:",
+                        error.message
+                    );
                 }
-            });
-
-        archive.on("error", err => {
-            if (!res.headersSent) {
-                res.status(500).end();
             }
-        });
-
-        archive.pipe(res);
-
-        session.files.forEach(file => {
-            archive.file(
-                file.path,
-                {
-                    name: file.name
-                }
-            );
-        });
-
-        archive.finalize();
+        );
     }
 );
 
-function escapeHtml(text) {
-    return String(text)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-}
 
-/* CLEANUP */
-setInterval(() => {
+// ----------------------------------------
+// HEALTH
+// ----------------------------------------
 
-    const now = Date.now();
+app.get("/health", (req, res) => {
 
-    for (const [id, session] of sessions) {
+    res.json({
+        status: "online",
+        service: "ShareX",
+        time: new Date().toISOString()
+    });
+});
 
-        if (now > session.expiresAt) {
-            deleteSession(id);
-        }
-    }
-
-}, 60 * 1000);
 
 app.listen(PORT, "0.0.0.0", () => {
 
     console.log(
-        "ShareX Relay running on port " + PORT
+        "ShareX server running on port " +
+        PORT
     );
-
 });
