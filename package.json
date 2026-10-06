@@ -1,7 +1,7 @@
 {
   "name": "sharex-server",
   "version": "1.0.0",
-  "description": "ShareX internet file sharing server",
+  "description": "ShareX Internet File Sharing Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
